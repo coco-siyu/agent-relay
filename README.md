@@ -16,6 +16,29 @@ Open <http://127.0.0.1:8000/>. The API connects to the Compose service named
 with `docker compose down`. Add `-v` only when you intentionally want to delete
 the database volume as well.
 
+## Run on a local kind cluster
+
+Build the application image, create a cluster, load the image into its node,
+and apply the Kubernetes manifests:
+
+```bash
+docker build -t agent-relay:local .
+kind create cluster --name agent-relay \
+  --image kindest/node:v1.31.9@sha256:b94a3a6c06198d17f59cca8c6f486236fa05e2fb359cbd75dabbfc348a10b211
+kind load docker-image agent-relay:local --name agent-relay
+kubectl --context kind-agent-relay apply -f k8s/
+kubectl --context kind-agent-relay wait \
+  --for=condition=available deployment/postgres --timeout=5m
+kubectl --context kind-agent-relay wait \
+  --for=condition=available deployment/agent-relay --timeout=5m
+kubectl --context kind-agent-relay port-forward service/agent-relay 8000:8000
+```
+
+Then open <http://127.0.0.1:8000/>. The `postgres-data` persistent volume
+claim retains database files across PostgreSQL pod restarts. The credentials in
+`k8s/secret.yaml` are local-development defaults and must be replaced before
+using these manifests in a shared environment.
+
 ## Run it
 
 ```bash
