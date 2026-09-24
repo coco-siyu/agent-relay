@@ -133,3 +133,22 @@ running tests against another database.
 
 The project intentionally does not include an external message broker or an
 LLM. Those are outside the relay protocol.
+
+## Run CI locally with act
+
+The workflow tests the application against a temporary PostgreSQL container,
+builds a uniquely tagged image, loads it into the `agent-relay` kind cluster,
+and waits for the Kubernetes rollout. Run it from the repository root:
+
+```bash
+docker_host="$(docker context inspect desktop-linux --format '{{.Endpoints.docker.Host}}')"
+DOCKER_HOST="$docker_host" act push \
+  -W .github/workflows/ci.yml \
+  -P ubuntu-latest=-self-hosted \
+  --pull=false \
+  --env ACT_PROJECT_DIR="$PWD" \
+  --env DOCKER_HOST
+```
+
+The self-hosted act runner intentionally uses the host's Docker daemon,
+kind cluster, and kubeconfig, so only run trusted workflow changes this way.

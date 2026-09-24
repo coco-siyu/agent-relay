@@ -1,0 +1,167 @@
+name: CI and kind deploy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PostgreSQL tests
+    runs-on: ubuntu-latest
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@127.0.0.1:55432/agent_relay_ci
+      RELAY_INTEGRATION_BASE_URL: http://127.0.0.1:8765
+    steps:
+      - name: Check out repository
+        if: ${{ env.ACT != 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Resolve project workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="${ACT_PROJECT_DIR:-$GITHUB_WORKSPACE}"
+          test -f "$project_dir/pyproject.toml"
+          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm --force agent-relay-ci-postgres 2>/dev/null || true
+          docker run --detach --name agent-relay-ci-postgres \
+            --publish 127.0.0.1:55432:5432 \
+            --env POSTGRES_DB=agent_relay_ci \
+            --env POSTGRES_USER=agent_relay \
+            --env POSTGRES_PASSWORD=agent_relay \
+            postgres:16-alpine
+          for _ in {1..30}; do
+            if docker exec agent-relay-ci-postgres \
+              pg_isready -U agent_relay -d agent_relay_ci >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs agent-relay-ci-postgres
+          exit 1
+
+      - name: Set up Python
+        if: ${{ env.ACT != 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        if: ${{ env.ACT != 'true' }}
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.32"
+          enable-cache: false
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: uv sync --frozen
+
+      - name: Run starter tests against PostgreSQL
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: uv run --frozen pytest -q test_agent_relay.py
+
+      - name: Run API integration test against PostgreSQL
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP:-/tmp}/agent-relay-ci-uvicorn.log"
+          uv run --frozen uvicorn main:app --host 127.0.0.1 --port 8765 >"$log_file" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8765/ready >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$log_file"
+            exit 1
+          fi
+
+          uv run --frozen pytest -q test_api_integration.py
+
+      - name: Stop PostgreSQL
+        if: ${{ always() }}
+        run: docker rm --force agent-relay-ci-postgres
+
+  build-and-deploy:
+    name: Build and deploy to kind
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        if: ${{ env.ACT != 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Resolve project workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="${ACT_PROJECT_DIR:-$GITHUB_WORKSPACE}"
+          test -f "$project_dir/Dockerfile"
+          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+
+      - name: Generate unique image tag
+        id: image
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:-local}"
+          short_sha="${short_sha:0:12}"
+          build_id="$(python3 -c 'import time; print(time.time_ns())')"
+          image="agent-relay:ci-${short_sha}-${build_id}"
+          echo "IMAGE_TAG=$image" >> "$GITHUB_ENV"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Building $image"
+
+      - name: Build image
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: docker build --tag "$IMAGE_TAG" .
+
+      - name: Check local deployment tools
+        if: ${{ env.ACT == 'true' || vars.DEPLOY_TO_KIND == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          docker version
+          kind version
+          kubectl version --client
+          kubectl --context kind-agent-relay get node agent-relay-control-plane
+
+      - name: Load image into kind
+        if: ${{ env.ACT == 'true' || vars.DEPLOY_TO_KIND == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: kind load docker-image "$IMAGE_TAG" --name agent-relay
+
+      - name: Deploy image and wait for rollout
+        if: ${{ env.ACT == 'true' || vars.DEPLOY_TO_KIND == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl --context kind-agent-relay set image \
+            deployment/agent-relay agent-relay="$IMAGE_TAG"
+          kubectl --context kind-agent-relay annotate deployment/agent-relay \
+            agent-relay/image-tag="$IMAGE_TAG" --overwrite
+          kubectl --context kind-agent-relay rollout status \
+            deployment/agent-relay --timeout=5m
+          kubectl --context kind-agent-relay get pods -l app=agent-relay -o wide
