@@ -1,9 +1,9 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module supports PostgreSQL for deployed environments and retains SQLite
+for lightweight local tests.  The rest of the application talks to the models
+through :mod:`storage`, keeping database-specific transaction behavior in one
+place.
 """
 
 from __future__ import annotations
@@ -22,6 +22,10 @@ def _database_url() -> str:
     return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
 
 
+def _is_sqlite(url: str) -> bool:
+    return url.startswith("sqlite")
+
+
 def positive_int(name: str, default: int) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -31,6 +35,7 @@ def positive_int(name: str, default: int) -> int:
 
 
 DATABASE_URL = _database_url()
+IS_SQLITE = _is_sqlite(DATABASE_URL)
 LEASE_SECONDS = positive_int("RELAY_LEASE_SECONDS", 60)
 MAX_ATTEMPTS = positive_int("RELAY_MAX_ATTEMPTS", 5)
 RECOVERY_INTERVAL_SECONDS = max(1, positive_int("RELAY_RECOVERY_INTERVAL_SECONDS", 5))
@@ -130,12 +135,8 @@ class Attempt(Base):
     task: Mapped[Task] = relationship("Task", back_populates="attempts")
 
 
-def _is_sqlite(url: str) -> bool:
-    return url.startswith("sqlite")
-
-
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
     if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
         from sqlalchemy.pool import StaticPool
@@ -144,7 +145,7 @@ if _is_sqlite(DATABASE_URL):
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
@@ -177,14 +178,19 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
     SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
     ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    terminal submissions) across API processes. PostgreSQL uses a normal
+    transaction; storage operations acquire row locks on the records they
+    coordinate.
     """
+
+    if not IS_SQLITE:
+        with db_session() as db:
+            yield db
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -205,29 +211,38 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+    query = (
+        select(Task, Attempt)
+        .join(Attempt, Attempt.task_id == Task.id)
+        .where(
+            Task.status == "processing",
+            Attempt.outcome == "processing",
+            Attempt.lease_expires_at <= now_db,
         )
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if not IS_SQLITE:
+        # Keep lock ordering consistent with heartbeat and completion: task
+        # first, then attempt. SKIP LOCKED lets another API replica recover
+        # unrelated expired work without waiting.
+        query = query.with_for_update(of=Task, skip_locked=True)
+    expired = list(db.execute(query).all())
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task, attempt in expired:
+        if not IS_SQLITE:
+            attempt = db.scalar(select(Attempt).where(Attempt.id == attempt.id).with_for_update())
+        if attempt is None or attempt.outcome != "processing" or task.status != "processing":
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
-        if task.status == "processing":
-            if task.attempt_count >= MAX_ATTEMPTS:
-                task.status = "failed"
-                task.error = "attempts_exhausted"
-                task.output = None
-                task.finished_at = now_db
-            else:
-                task.status = "queued"
-                task.finished_at = None
+        if task.attempt_count >= MAX_ATTEMPTS:
+            task.status = "failed"
+            task.error = "attempts_exhausted"
+            task.output = None
+            task.finished_at = now_db
+        else:
+            task.status = "queued"
+            task.finished_at = None
         count += 1
     return count
 
@@ -249,6 +264,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MAX_BODY_BYTES",
     "MAX_PAGE_SIZE",
+    "IS_SQLITE",
     "RECOVERY_INTERVAL_SECONDS",
     "Task",
     "as_db_time",

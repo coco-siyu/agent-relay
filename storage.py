@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from database import (
     Agent,
     Attempt,
+    IS_SQLITE,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     Task,
@@ -107,6 +108,13 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
     # Serializing task creation makes the sender-scoped idempotency check and
     # unique constraint one operation even when two API processes race.
     with immediate_transaction() as db:
+        if not IS_SQLITE:
+            # Serialize idempotent task creation per sender. Without this lock,
+            # two PostgreSQL transactions could both miss the key and race on
+            # the unique constraint.
+            sender = db.scalar(select(Agent).where(Agent.id == sender_id).with_for_update())
+            if sender is None:
+                raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
             raise RelayError("not_found", "Recipient agent not found.", 404)
@@ -144,12 +152,15 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if not IS_SQLITE:
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
@@ -187,18 +198,29 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
         }
 
 
-def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
-    return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+def _task_for_update(db: Session, task_id: str) -> Task | None:
+    query = select(Task).where(Task.id == task_id)
+    if not IS_SQLITE:
+        query = query.with_for_update()
+    return db.scalar(query)
+
+
+def _find_attempt_for_token(db: Session, task_id: str, token: str, *, lock: bool = False) -> Attempt | None:
+    query = select(Attempt).where(
+        Attempt.task_id == task_id,
+        Attempt.claim_token_hash == secret_hash(token),
     )
+    if lock and not IS_SQLITE:
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = _task_for_update(db, task_id)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, lock=True)
         now = utcnow()
         if (
             attempt is None
@@ -222,10 +244,10 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = _task_for_update(db, task_id)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, lock=True)
         if attempt is None:
             raise RelayError("stale_claim", "This claim is no longer active.", 409)
         value_digest = payload_hash(value)
